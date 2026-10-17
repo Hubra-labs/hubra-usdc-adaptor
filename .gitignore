@@ -1,0 +1,8 @@
+# deploy identity — keep out of git; back it up separately
+program-keypair.json
+program-keypair.*.json
+target/
+node_modules/
+vanity/
+# third-party program dumps: regenerate with `npm run fixtures`
+tests/protocols/*/*.so

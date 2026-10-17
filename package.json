@@ -1,0 +1,14 @@
+{
+  "name": "hubra-usdc-adaptor",
+  "private": true,
+  "description": "Tests and tooling for the Hubra unified USDC Voltr adaptor",
+  "scripts": {
+    "build": "cargo-build-sbf",
+    "test": "node tests/run-all.js",
+    "fixtures": "node tests/fetch-fixtures.js"
+  },
+  "devDependencies": {
+    "@solana/kit": "^8.4.0",
+    "litesvm": "^1.5.0"
+  }
+}

@@ -1,0 +1,28 @@
+[package]
+name = "hubra-usdc-adaptor"
+version = "0.2.0"
+description = "Hubra unified Voltr adaptor for USDC integrations (instant deposit/withdraw protocols only)"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "hubra_usdc_adaptor"
+
+[features]
+default = []
+no-entrypoint = []
+cpi = ["no-entrypoint"]
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+
+[dependencies]
+anchor-lang = "0.31.1"
+anchor-spl = "0.31.1"
+
+[profile.release]
+overflow-checks = true
+lto = "fat"
+codegen-units = 1
+
+# anchor 0.31 macros reference cfgs rustc doesn't know about
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("solana"))', 'cfg(feature, values("custom-heap", "custom-panic", "anchor-debug", "no-idl", "no-log-ix-name"))'] }
