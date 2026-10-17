@@ -207,6 +207,36 @@ const cases = [
     },
   },
   {
+    name: "refuses to report a value if marginfi data doesn't match the expected layout",
+    async run(svm) {
+      const voltr = await initialized(svm, 100n * USDC_1);
+      expectOk(await send(svm, voltr, [await deposit(voltr, 100n * USDC_1)]), "deposit");
+      const account = await marginfiAccount(voltr.auth.address);
+      const patch = (addr, offset, byte) => {
+        const a = svm.getAccount(addr); const d = Buffer.from(a.data); d[offset] = byte;
+        svm.setAccount({ ...a, address: addr, data: new Uint8Array(d) });
+      };
+      const original = (addr) => Buffer.from(svm.getAccount(addr).data);
+      const bank0 = original(M.bank), acct0 = original(account);
+      const restore = () => {
+        svm.setAccount({ ...svm.getAccount(M.bank), address: M.bank, data: new Uint8Array(bank0) });
+        svm.setAccount({ ...svm.getAccount(account), address: account, data: new Uint8Array(acct0) });
+      };
+      for (const [name, addr, offset, byte] of [
+        ["bank mint", M.bank, 8, bank0[8] ^ 0xff],
+        ["bank group", M.bank, 41, bank0[41] ^ 0xff],
+        ["balance asset tag", account, 72 + 33, 3],
+        ["balance active flag", account, 72, 2],
+      ]) {
+        patch(addr, offset, byte);
+        const res = await send(svm, voltr, [await deposit(voltr, 0)]);
+        assert(!res.ok, `${name}: refresh must fail, got value ${res.returns}`);
+        restore();
+      }
+      expectOk(await send(svm, voltr, [await deposit(voltr, 0)]), "refresh after restore");
+    },
+  },
+  {
     name: "rejects wrong protocol program",
     async run(svm) {
       const voltr = await initialized(svm, 0n);

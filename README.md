@@ -212,6 +212,12 @@ is empty, the re-opening deposit fails cleanly and funds stay idle.
 
 The strategy authority owns marginfi account
 `PDA("marginfi_account", group, authority, 0u16, 0u16)` (no third-party id).
+The adaptor decodes marginfi's raw Bank / MarginfiAccount bytes at fixed
+offsets. Because marginfi is upgradeable, every read cross-checks what it can
+verify: the bank's mint and group, our shares ≤ the bank's total shares, and
+that every active balance is a liability-free default-tag balance in our bank.
+If marginfi ever moves those fields, P0 refresh/deposit/withdraw fail instead
+of reporting a wrong value. Fix the offsets, re-run the suites, and upgrade.
 Withdrawals settle instantly only up to the bank's free liquidity (273.9k USDC
 at 96.6% utilization on 2026-10-17); beyond that marginfi rejects them and
 funds stay put. Withdraws still work with a stale oracle, because the account

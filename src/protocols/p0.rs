@@ -30,10 +30,11 @@ pub const P0_PROGRAM_ID: Pubkey = pubkey!("MFv2hWf31Z9kbCa1snEPYctwafyhdvnV7FZns
 
 /// A marginfi bank this adaptor may lend into. marginfi validates the bank
 /// against the group and its own vaults/oracles, so only the group and bank
-/// themselves are pinned.
+/// themselves are pinned; `mint` is a layout check on the bank's data.
 pub struct P0Market {
     pub bank: Pubkey,
     pub group: Pubkey,
+    pub mint: Pubkey,
 }
 
 /// Registered markets, keyed by `bank` (== Voltr strategy id).
@@ -42,6 +43,7 @@ pub const P0_MARKETS: &[P0Market] = &[
     P0Market {
         bank: pubkey!("2s37akK2eyBbp8DZgCm7RtsaEz8eJP3Nxd4urLHQv7yB"),
         group: pubkey!("4qp6Fx6tnZkY5Wropq9wUYgtFxXKwE6viZxFHg3rdAG8"),
+        mint: pubkey!("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"),
     },
 ];
 
@@ -54,14 +56,22 @@ const BANK_ACCOUNT_DISC: [u8; 8] = [142, 49, 166, 242, 50, 66, 97, 188];
 const MARGINFI_ACCOUNT_DISC: [u8; 8] = [67, 178, 130, 109, 126, 114, 28, 42];
 
 const MARGINFI_ACCOUNT_SEED: &[u8] = b"marginfi_account";
+/// marginfi `ASSET_TAG_DEFAULT`: a plain lending bank (not Kamino/Drift/... wrapped).
+const ASSET_TAG_DEFAULT: u8 = 0;
 const ACCOUNT_INDEX: u16 = 0;
 const THIRD_PARTY_ID: u16 = 0;
 
 /// Byte offsets into the raw accounts (8-byte anchor discriminator included),
 /// from marginfi's `#[repr(C)]` zero-copy layouts: Bank (3904 bytes) and
 /// MarginfiAccount (2304 bytes), each holding I80F48 values as i128 LE.
+/// marginfi is upgradeable, so `position_value_from_data` cross-checks fields
+/// it can verify (mint, group, share totals, balance shape) and fails rather
+/// than report a value if the layout ever moves.
 const BANK_LEN: usize = 8 + 3904;
+const BANK_MINT: usize = 8;
+const BANK_GROUP: usize = 8 + 33;
 const BANK_ASSET_SHARE_VALUE: usize = 8 + 72;
+const BANK_TOTAL_ASSET_SHARES: usize = 8 + 264;
 const ACCOUNT_LEN: usize = 8 + 2304;
 const ACCOUNT_GROUP: usize = 8;
 const ACCOUNT_AUTHORITY: usize = 8 + 32;
@@ -70,6 +80,7 @@ const BALANCE_LEN: usize = 104;
 const MAX_BALANCES: usize = 16;
 const BALANCE_ACTIVE: usize = 0;
 const BALANCE_BANK: usize = 1;
+const BALANCE_ASSET_TAG: usize = 33;
 const BALANCE_ASSET_SHARES: usize = 40;
 const BALANCE_LIABILITY_SHARES: usize = 56;
 
@@ -142,37 +153,68 @@ pub fn shares_to_amount(shares: i128, share_value: i128) -> Result<u64> {
 fn read_position_value(
     bank: &AccountInfo,
     marginfi_account: &AccountInfo,
-    group: &Pubkey,
+    market: &P0Market,
     authority: &Pubkey,
 ) -> Result<u64> {
     require_keys_eq!(*bank.owner, P0_PROGRAM_ID, AdaptorError::InvalidProtocolVault);
-    let bank_data = bank.try_borrow_data()?;
+    require_keys_eq!(*marginfi_account.owner, P0_PROGRAM_ID, AdaptorError::InvalidProtocolAccount);
+    position_value_from_data(
+        &bank.try_borrow_data()?,
+        &marginfi_account.try_borrow_data()?,
+        market,
+        authority,
+    )
+}
+
+/// Decodes the position from raw bank + marginfi account data, failing on
+/// anything that doesn't fit the expected layout instead of reporting a value.
+pub fn position_value_from_data(
+    bank: &[u8],
+    acc: &[u8],
+    market: &P0Market,
+    authority: &Pubkey,
+) -> Result<u64> {
     require!(
-        bank_data.len() >= BANK_LEN && bank_data[..8] == BANK_ACCOUNT_DISC,
+        bank.len() >= BANK_LEN
+            && bank[..8] == BANK_ACCOUNT_DISC
+            && bank[BANK_MINT..BANK_MINT + 32] == market.mint.to_bytes()
+            && bank[BANK_GROUP..BANK_GROUP + 32] == market.group.to_bytes(),
         AdaptorError::InvalidProtocolVault
     );
-    let share_value = read_i128(&bank_data, BANK_ASSET_SHARE_VALUE)?;
+    let share_value = read_i128(bank, BANK_ASSET_SHARE_VALUE)?;
+    let bank_total_shares = read_i128(bank, BANK_TOTAL_ASSET_SHARES)?;
 
-    require_keys_eq!(*marginfi_account.owner, P0_PROGRAM_ID, AdaptorError::InvalidProtocolAccount);
-    let acc = marginfi_account.try_borrow_data()?;
     require!(
         acc.len() >= ACCOUNT_LEN
             && acc[..8] == MARGINFI_ACCOUNT_DISC
-            && acc[ACCOUNT_GROUP..ACCOUNT_GROUP + 32] == group.to_bytes()
+            && acc[ACCOUNT_GROUP..ACCOUNT_GROUP + 32] == market.group.to_bytes()
             && acc[ACCOUNT_AUTHORITY..ACCOUNT_AUTHORITY + 32] == authority.to_bytes(),
         AdaptorError::InvalidProtocolAccount
     );
 
+    // Only the strategy authority can add balances, and it only ever lends to
+    // `market.bank`, so every active slot must be that bank. Anything else
+    // means the layout moved (or something is badly wrong): fail, don't report.
+    let mut value = None;
     for i in 0..MAX_BALANCES {
         let b = &acc[ACCOUNT_BALANCES + i * BALANCE_LEN..ACCOUNT_BALANCES + (i + 1) * BALANCE_LEN];
-        if b[BALANCE_ACTIVE] == 0 || b[BALANCE_BANK..BALANCE_BANK + 32] != bank.key.to_bytes() {
-            continue;
+        match b[BALANCE_ACTIVE] {
+            0 => continue,
+            1 => {}
+            _ => return err!(AdaptorError::InvalidProtocolAccount),
         }
-        // The strategy only ever lends; a liability here means something is badly wrong.
-        require!(read_i128(b, BALANCE_LIABILITY_SHARES)? == 0, AdaptorError::InvalidProtocolAccount);
-        return shares_to_amount(read_i128(b, BALANCE_ASSET_SHARES)?, share_value);
+        require!(
+            value.is_none()
+                && b[BALANCE_BANK..BALANCE_BANK + 32] == market.bank.to_bytes()
+                && b[BALANCE_ASSET_TAG] == ASSET_TAG_DEFAULT
+                && read_i128(b, BALANCE_LIABILITY_SHARES)? == 0,
+            AdaptorError::InvalidProtocolAccount
+        );
+        let shares = read_i128(b, BALANCE_ASSET_SHARES)?;
+        require!(shares <= bank_total_shares, AdaptorError::InvalidProtocolAccount);
+        value = Some(shares_to_amount(shares, share_value)?);
     }
-    Ok(0)
+    Ok(value.unwrap_or(0))
 }
 
 /// marginfi_account_initialize_pda(ACCOUNT_INDEX, None) for `authority`, rent
@@ -435,7 +477,7 @@ impl<'info> P0Operate<'info> {
         read_position_value(
             &self.bank.to_account_info(),
             &self.marginfi_account.to_account_info(),
-            self.marginfi_group.key,
+            market_for(self.voltr.strategy.key)?,
             self.voltr.vault_strategy_auth.key,
         )
     }
@@ -512,6 +554,97 @@ mod tests {
 
     fn anchor_disc(preimage: &str) -> [u8; 8] {
         hash(preimage.as_bytes()).to_bytes()[..8].try_into().unwrap()
+    }
+
+    fn market() -> &'static P0Market {
+        &P0_MARKETS[0]
+    }
+
+    /// Bank with asset_share_value 1.25 and 1M total shares.
+    fn bank_data() -> Vec<u8> {
+        let m = market();
+        let mut d = vec![0u8; BANK_LEN];
+        d[..8].copy_from_slice(&BANK_ACCOUNT_DISC);
+        d[BANK_MINT..BANK_MINT + 32].copy_from_slice(&m.mint.to_bytes());
+        d[BANK_GROUP..BANK_GROUP + 32].copy_from_slice(&m.group.to_bytes());
+        d[BANK_ASSET_SHARE_VALUE..BANK_ASSET_SHARE_VALUE + 16].copy_from_slice(&(ONE + ONE / 4).to_le_bytes());
+        d[BANK_TOTAL_ASSET_SHARES..BANK_TOTAL_ASSET_SHARES + 16].copy_from_slice(&(1_000_000 * ONE).to_le_bytes());
+        d
+    }
+
+    /// marginfi account for `auth` with one active balance of `shares` (whole shares) in slot `slot`.
+    fn account_data(auth: &Pubkey, slot: usize, shares: i128) -> Vec<u8> {
+        let m = market();
+        let mut d = vec![0u8; ACCOUNT_LEN];
+        d[..8].copy_from_slice(&MARGINFI_ACCOUNT_DISC);
+        d[ACCOUNT_GROUP..ACCOUNT_GROUP + 32].copy_from_slice(&m.group.to_bytes());
+        d[ACCOUNT_AUTHORITY..ACCOUNT_AUTHORITY + 32].copy_from_slice(&auth.to_bytes());
+        let b = ACCOUNT_BALANCES + slot * BALANCE_LEN;
+        d[b + BALANCE_ACTIVE] = 1;
+        d[b + BALANCE_BANK..b + BALANCE_BANK + 32].copy_from_slice(&m.bank.to_bytes());
+        d[b + BALANCE_ASSET_SHARES..b + BALANCE_ASSET_SHARES + 16].copy_from_slice(&(shares * ONE).to_le_bytes());
+        d
+    }
+
+    #[test]
+    fn position_decodes_expected_layout() {
+        let auth = Pubkey::new_unique();
+        // 1000 shares x 1.25, in any slot
+        for slot in [0, 7, 15] {
+            let v = position_value_from_data(&bank_data(), &account_data(&auth, slot, 1000), market(), &auth).unwrap();
+            assert_eq!(v, 1250);
+        }
+        // no active balance: empty position
+        let mut empty = account_data(&auth, 0, 1000);
+        empty[ACCOUNT_BALANCES + BALANCE_ACTIVE] = 0;
+        assert_eq!(position_value_from_data(&bank_data(), &empty, market(), &auth).unwrap(), 0);
+    }
+
+    #[test]
+    fn position_rejects_unexpected_bank_data() {
+        let auth = Pubkey::new_unique();
+        let acc = account_data(&auth, 0, 1000);
+        for (off, name) in [(BANK_MINT, "mint"), (BANK_GROUP, "group"), (0, "discriminator")] {
+            let mut bank = bank_data();
+            bank[off] ^= 0xff;
+            assert!(position_value_from_data(&bank, &acc, market(), &auth).is_err(), "bank {name}");
+        }
+        assert!(position_value_from_data(&bank_data()[..BANK_LEN - 1], &acc, market(), &auth).is_err(), "short bank");
+        // more shares than the bank has in total
+        let big = account_data(&auth, 0, 2_000_000);
+        assert!(position_value_from_data(&bank_data(), &big, market(), &auth).is_err(), "shares > bank total");
+    }
+
+    #[test]
+    fn position_rejects_unexpected_account_data() {
+        let auth = Pubkey::new_unique();
+        let bank = bank_data();
+        let base = account_data(&auth, 0, 1000);
+        let b = ACCOUNT_BALANCES;
+        let cases: Vec<(&str, Box<dyn Fn(&mut Vec<u8>)>)> = vec![
+            ("other authority", Box::new(|d| d[ACCOUNT_AUTHORITY] ^= 0xff)),
+            ("other group", Box::new(|d| d[ACCOUNT_GROUP] ^= 0xff)),
+            ("active flag not 0/1", Box::new(move |d| d[b + BALANCE_ACTIVE] = 2)),
+            ("active balance in another bank", Box::new(move |d| d[b + BALANCE_BANK] ^= 0xff)),
+            ("wrapped asset tag", Box::new(move |d| d[b + BALANCE_ASSET_TAG] = 3)),
+            ("liability", Box::new(move |d| d[b + BALANCE_LIABILITY_SHARES] = 1)),
+            ("second active balance", Box::new(move |d| {
+                let (src, dst) = (b, b + BALANCE_LEN);
+                let slot: Vec<u8> = d[src..src + BALANCE_LEN].to_vec();
+                d[dst..dst + BALANCE_LEN].copy_from_slice(&slot);
+            })),
+            // a layout shift: balances start 8 bytes later than we assume
+            ("balances shifted", Box::new(move |d| {
+                let moved: Vec<u8> = d[b..ACCOUNT_LEN - 8].to_vec();
+                d[b + 8..].copy_from_slice(&moved);
+                d[b..b + 8].fill(0x01);
+            })),
+        ];
+        for (name, mutate) in cases {
+            let mut acc = base.clone();
+            mutate(&mut acc);
+            assert!(position_value_from_data(&bank, &acc, market(), &auth).is_err(), "{name}");
+        }
     }
 
     #[test]
