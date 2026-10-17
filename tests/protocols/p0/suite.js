@@ -6,10 +6,12 @@ const {
   B, USDC, meta, randomAddress, setTokenAccount, tokenBalance,
   voltrStrategy, initializeIx, operateIx, send, assert, expectOk, expectAdaptorError,
 } = require("../../harness");
-const { getAddressEncoder, getProgramDerivedAddress } = require("@solana/kit");
+const { getAddressEncoder, getAddressDecoder, getProgramDerivedAddress, lamports } = require("@solana/kit");
+const crypto = require("crypto");
 
 const MARGINFI = B("MFv2hWf31Z9kbCa1snEPYctwafyhdvnV7FZnsebVacA");
 const INSTRUCTIONS_SYSVAR = B("Sysvar1nstructions1111111111111111111111111");
+const SYSTEM = B("11111111111111111111111111111111");
 const M = {
   group: B("4qp6Fx6tnZkY5Wropq9wUYgtFxXKwE6viZxFHg3rdAG8"),
   bank: B("2s37akK2eyBbp8DZgCm7RtsaEz8eJP3Nxd4urLHQv7yB"),
@@ -42,6 +44,7 @@ async function operateRemaining(voltr, o = {}) {
     meta(o.program ?? MARGINFI, false), meta(o.group ?? M.group, false),
     meta(o.account ?? await marginfiAccount(voltr.auth.address), true), meta(bank, true),
     meta(M.liquidityVault, true), meta(await liquidityVaultAuthority(bank), false), meta(M.oracle, false),
+    meta(INSTRUCTIONS_SYSVAR, false), meta(SYSTEM, false),
   ];
 }
 
@@ -59,9 +62,36 @@ async function initialized(svm, usdc) {
   return voltr;
 }
 
-/** What the Voltr vault does right after a successful withdraw: sweep `amount` back to idle. */
-function vaultSweep(svm, voltr, amount) {
-  setTokenAccount(svm, voltr.usdcAta, USDC, voltr.auth.address, tokenBalance(svm, voltr.usdcAta) - BigInt(amount));
+/** What the Voltr vault does right after a successful withdraw: sweep the whole strategy ATA to idle. */
+function vaultSweep(svm, voltr) {
+  setTokenAccount(svm, voltr.usdcAta, USDC, voltr.auth.address, 0);
+}
+
+/** marginfi's permissionless admin_close_account (empty account, no activity for > 60 days). */
+async function adminCloseIx(svm, account) {
+  const group = Buffer.from(svm.getAccount(M.group).data);
+  const globalFeeWallet = getAddressDecoder().decode(group.subarray(48, 80)); // fee_state_cache.global_fee_wallet
+  const pool = (await getProgramDerivedAddress({ programAddress: MARGINFI, seeds: [Buffer.from("rebalance_fee_pool"), enc.encode(account)] }))[0];
+  return {
+    programAddress: MARGINFI,
+    accounts: [meta(M.group, false), meta(account, true), meta(globalFeeWallet, true), meta(pool, false)],
+    data: new Uint8Array(crypto.createHash("sha256").update("global:admin_close_account").digest().subarray(0, 8)),
+  };
+}
+
+/** Deposit, fully exit, then let a third party close the empty account after 61 idle days. */
+async function exitedAndClosed(svm) {
+  const voltr = await initialized(svm, 100n * USDC_1);
+  const [v] = expectOk(await send(svm, voltr, [await deposit(voltr, 100n * USDC_1)]), "deposit").returns;
+  expectOk(await send(svm, voltr, [await withdraw(voltr, v)]), "full exit");
+  vaultSweep(svm, voltr);
+  const account = await marginfiAccount(voltr.auth.address);
+  const stranger = await voltrStrategy(svm, 0);
+  assert(!(await send(svm, stranger, [await adminCloseIx(svm, account)])).ok, "close must fail while recently active");
+  advanceClock(svm, 61 * 86_400);
+  expectOk(await send(svm, stranger, [await adminCloseIx(svm, account)]), "admin_close after 61 days");
+  assert(!svm.getAccount(account).exists, "marginfi account should be closed");
+  return { voltr, account };
 }
 
 function advanceClock(svm, seconds) {
@@ -88,7 +118,7 @@ const cases = [
       assert(tokenBalance(svm, voltr.usdcAta) === 200n * USDC_1, "withdraw must deliver exactly 200 USDC");
       const drop = valDep - valW;
       assert(drop >= 200n * USDC_1 && drop <= 200n * USDC_1 + 1n, `withdraw 200 moved value by ${drop}`);
-      vaultSweep(svm, voltr, 200n * USDC_1);
+      vaultSweep(svm, voltr);
 
       // Full exit as the rebalancer requests it: the current position value.
       const [valX] = expectOk(await send(svm, voltr, [await withdraw(voltr, valW)]), "full exit").returns;
@@ -146,6 +176,34 @@ const cases = [
       assert(!res.ok, "withdrawing beyond free liquidity must fail");
       const [after] = expectOk(await send(svm, voltr, [await withdraw(voltr, 0)]), "refresh").returns;
       assert(after === v, "failed withdraw must not change the position");
+    },
+  },
+  {
+    name: "closed account (permissionless admin_close): refresh reports 0, withdraw fails, deposit re-opens",
+    async run(svm) {
+      const { voltr, account } = await exitedAndClosed(svm);
+      const [vd] = expectOk(await send(svm, voltr, [await deposit(voltr, 0)]), "refresh (deposit 0)").returns;
+      const [vw] = expectOk(await send(svm, voltr, [await withdraw(voltr, 0)]), "refresh (withdraw 0)").returns;
+      assert(vd === 0n && vw === 0n, `closed account must report 0, got ${vd}/${vw}`);
+      expectAdaptorError(await send(svm, voltr, [await withdraw(voltr, 1n * USDC_1)]), "NoPosition", "withdraw from closed account");
+
+      setTokenAccount(svm, voltr.usdcAta, USDC, voltr.auth.address, 50n * USDC_1);
+      const res = expectOk(await send(svm, voltr, [await deposit(voltr, 50n * USDC_1)]), "deposit re-opens");
+      assert(res.logs.some((l) => l.includes("re-opening closed marginfi account")), "deposit should log the re-open");
+      assert(svm.getAccount(account).exists, "marginfi account should exist again");
+      assert(res.returns[0] >= 50n * USDC_1 - 1n, `re-opened position ${res.returns[0]} < 50 USDC`);
+      const [after] = expectOk(await send(svm, voltr, [await withdraw(voltr, 20n * USDC_1)]), "withdraw after re-open").returns;
+      assert(after >= 30n * USDC_1 - 1n && after <= 30n * USDC_1, `value after withdraw ${after}`);
+    },
+  },
+  {
+    name: "re-open still works if someone pre-funds the closed account's address",
+    async run(svm) {
+      const { voltr, account } = await exitedAndClosed(svm);
+      svm.airdrop(account, lamports(1_000_000n)); // griefing attempt: make it a funded system account
+      setTokenAccount(svm, voltr.usdcAta, USDC, voltr.auth.address, 10n * USDC_1);
+      const [v] = expectOk(await send(svm, voltr, [await deposit(voltr, 10n * USDC_1)]), "deposit re-opens").returns;
+      assert(v >= 10n * USDC_1 - 1n, `re-opened position ${v}`);
     },
   },
   {

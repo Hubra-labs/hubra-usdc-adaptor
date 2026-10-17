@@ -9,6 +9,12 @@
 //! accrued interest in the same instruction. Settlement is instant as long as
 //! the bank's liquidity vault holds enough free USDC.
 //!
+//! marginfi lets anyone close an account that is empty and has had no
+//! deposit/withdraw for 60 days (`admin_close_account`, rent goes to P0's fee
+//! wallet). A closed account reports value 0, and the next deposit re-opens
+//! it, paying rent from the strategy authority's own lamports: fund that PDA
+//! with a little SOL (scripts/setup-hubra-adaptor.ts does).
+//!
 //! Strategy id convention: the marginfi bank account.
 
 use anchor_lang::prelude::*;
@@ -169,6 +175,48 @@ fn read_position_value(
     Ok(0)
 }
 
+/// marginfi_account_initialize_pda(ACCOUNT_INDEX, None) for `authority`, rent
+/// paid by `payer`. Account order per program: group, marginfi_account,
+/// authority, fee_payer, instructions_sysvar, system_program.
+fn init_marginfi_account<'info>(
+    p0_program: &AccountInfo<'info>,
+    group: &AccountInfo<'info>,
+    marginfi_account: &AccountInfo<'info>,
+    authority: &AccountInfo<'info>,
+    payer: &AccountInfo<'info>,
+    instructions: &AccountInfo<'info>,
+    system_program: &AccountInfo<'info>,
+) -> Result<()> {
+    let mut data = Vec::with_capacity(11);
+    data.extend_from_slice(&INITIALIZE_PDA_DISC);
+    data.extend_from_slice(&ACCOUNT_INDEX.to_le_bytes());
+    data.push(0); // third_party_id: None (seed uses 0)
+    invoke(
+        &Instruction {
+            program_id: P0_PROGRAM_ID,
+            accounts: vec![
+                AccountMeta::new_readonly(group.key(), false),
+                AccountMeta::new(marginfi_account.key(), false),
+                AccountMeta::new_readonly(authority.key(), true),
+                AccountMeta::new(payer.key(), true),
+                AccountMeta::new_readonly(instructions.key(), false),
+                AccountMeta::new_readonly(system_program.key(), false),
+            ],
+            data,
+        },
+        &[
+            group.clone(),
+            marginfi_account.clone(),
+            authority.clone(),
+            payer.clone(),
+            instructions.clone(),
+            system_program.clone(),
+            p0_program.clone(),
+        ],
+    )?;
+    Ok(())
+}
+
 // ------------------------------------------------------------------ accounts
 
 #[derive(Accounts)]
@@ -196,7 +244,7 @@ pub struct P0Initialize<'info> {
 
 /// Shared by deposit and withdraw. Remaining accounts mirror marginfi's
 /// lending_account_deposit / lending_account_withdraw plus the bank's oracle
-/// for withdraw's health check.
+/// for withdraw's health check, and what re-opening a closed account needs.
 #[derive(Accounts)]
 pub struct P0Operate<'info> {
     pub voltr: VoltrOperate<'info>,
@@ -225,9 +273,36 @@ pub struct P0Operate<'info> {
 
     /// CHECK: validated by marginfi against the bank's oracle config.
     pub bank_oracle: UncheckedAccount<'info>,
+
+    /// CHECK: address-checked; marginfi's init_pda reads it when re-opening.
+    #[account(address = instructions_sysvar::ID)]
+    pub instructions_sysvar: UncheckedAccount<'info>,
+
+    pub system_program: Program<'info, System>,
 }
 
 impl<'info> P0Operate<'info> {
+    /// The marginfi account exists. Its address is pinned to the PDA, which only
+    /// marginfi can allocate, so anything else means never opened or closed by
+    /// `admin_close_account` (only possible while empty).
+    fn account_open(&self) -> bool {
+        *self.marginfi_account.owner == P0_PROGRAM_ID
+    }
+
+    /// Re-creates a closed marginfi account, rent paid by the strategy authority.
+    fn reopen_account(&self) -> Result<()> {
+        msg!("P0: re-opening closed marginfi account");
+        init_marginfi_account(
+            &self.p0_program.to_account_info(),
+            &self.marginfi_group.to_account_info(),
+            &self.marginfi_account.to_account_info(),
+            &self.voltr.vault_strategy_auth.to_account_info(),
+            &self.voltr.vault_strategy_auth.to_account_info(),
+            &self.instructions_sysvar.to_account_info(),
+            &self.system_program.to_account_info(),
+        )
+    }
+
     fn validate(&self) -> Result<()> {
         validate_market(
             self.voltr.strategy.key,
@@ -341,8 +416,22 @@ impl<'info> P0Operate<'info> {
         Ok(())
     }
 
-    /// Position value in USDC: asset shares x the bank's asset_share_value.
+    /// Refresh: accrue the bank, then report. A closed account is empty, so
+    /// it reports 0 without touching marginfi.
+    fn refresh(&self) -> Result<u64> {
+        if !self.account_open() {
+            return Ok(0);
+        }
+        self.accrue_interest()?;
+        self.position_value()
+    }
+
+    /// Position value in USDC: asset shares x the bank's asset_share_value
+    /// (0 while the account is closed).
     fn position_value(&self) -> Result<u64> {
+        if !self.account_open() {
+            return Ok(0);
+        }
         read_position_value(
             &self.bank.to_account_info(),
             &self.marginfi_account.to_account_info(),
@@ -368,44 +457,28 @@ pub fn initialize(ctx: Context<P0Initialize>) -> Result<()> {
     if *a.marginfi_account.owner == P0_PROGRAM_ID {
         return Ok(());
     }
-    let mut data = Vec::with_capacity(11);
-    data.extend_from_slice(&INITIALIZE_PDA_DISC);
-    data.extend_from_slice(&ACCOUNT_INDEX.to_le_bytes());
-    data.push(0); // third_party_id: None (seed uses 0)
-    invoke(
-        &Instruction {
-            program_id: P0_PROGRAM_ID,
-            accounts: vec![
-                AccountMeta::new_readonly(a.marginfi_group.key(), false),
-                AccountMeta::new(a.marginfi_account.key(), false),
-                AccountMeta::new_readonly(a.voltr.vault_strategy_auth.key(), true),
-                AccountMeta::new(a.voltr.payer.key(), true),
-                AccountMeta::new_readonly(a.instructions_sysvar.key(), false),
-                AccountMeta::new_readonly(a.voltr.system_program.key(), false),
-            ],
-            data,
-        },
-        &[
-            a.marginfi_group.to_account_info(),
-            a.marginfi_account.to_account_info(),
-            a.voltr.vault_strategy_auth.to_account_info(),
-            a.voltr.payer.to_account_info(),
-            a.instructions_sysvar.to_account_info(),
-            a.voltr.system_program.to_account_info(),
-            a.p0_program.to_account_info(),
-        ],
-    )?;
-    Ok(())
+    init_marginfi_account(
+        &a.p0_program.to_account_info(),
+        &a.marginfi_group.to_account_info(),
+        &a.marginfi_account.to_account_info(),
+        &a.voltr.vault_strategy_auth.to_account_info(),
+        &a.voltr.payer.to_account_info(),
+        &a.instructions_sysvar.to_account_info(),
+        &a.voltr.system_program.to_account_info(),
+    )
 }
 
 /// Lends the `amount` of USDC the vault just moved into the strategy ATA and
 /// returns the position value. `amount == 0` only refreshes the position.
+/// Re-opens the marginfi account first if it was closed.
 pub fn deposit(ctx: Context<P0Operate>, amount: u64) -> Result<u64> {
     let a = ctx.accounts;
     a.validate()?;
     if amount == 0 {
-        a.accrue_interest()?;
-        return a.position_value();
+        return a.refresh();
+    }
+    if !a.account_open() {
+        a.reopen_account()?;
     }
     let before = a.voltr.vault_strategy_asset_ata.amount;
     a.deposit(amount)?;
@@ -422,9 +495,9 @@ pub fn withdraw(ctx: Context<P0Operate>, amount: u64) -> Result<u64> {
     let a = ctx.accounts;
     a.validate()?;
     if amount == 0 {
-        a.accrue_interest()?;
-        return a.position_value();
+        return a.refresh();
     }
+    require!(a.account_open(), AdaptorError::NoPosition);
     a.withdraw(amount)?;
     settle_withdraw(a.voltr.asset_balance()?, amount)?;
     a.position_value()

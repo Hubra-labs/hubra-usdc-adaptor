@@ -51,9 +51,9 @@ async function initialized(svm, usdc) {
   return voltr;
 }
 
-/** What the Voltr vault does right after a successful withdraw: sweep `amount` back to idle. */
-function vaultSweep(svm, voltr, amount) {
-  setTokenAccount(svm, voltr.usdcAta, USDC, voltr.auth.address, tokenBalance(svm, voltr.usdcAta) - BigInt(amount));
+/** What the Voltr vault does right after a successful withdraw: sweep the whole strategy ATA to idle. */
+function vaultSweep(svm, voltr) {
+  setTokenAccount(svm, voltr.usdcAta, USDC, voltr.auth.address, 0);
 }
 
 /** A self-consistent lookalike bankineco vault + share mint + ATA (the pre-pinning attack set). */
@@ -90,7 +90,7 @@ const cases = [
       assert(tokenBalance(svm, voltr.usdcAta) >= 200n * USDC_1, "withdraw must deliver >= 200 USDC");
       const drop = navDep - navW;
       assert(drop >= 199n * USDC_1 && drop <= 202n * USDC_1, `withdraw 200 moved nav by ${drop}`);
-      vaultSweep(svm, voltr, 200n * USDC_1);
+      vaultSweep(svm, voltr);
 
       // Full exit as the rebalancer requests it: nav minus the 15bps haircut.
       const exitAmount = (navW * 9985n) / 10000n;

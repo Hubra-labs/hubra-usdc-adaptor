@@ -8,7 +8,7 @@ vault's strategy CPIs.
 
 - **Program ID:** `raRnoKWoRcon9dqxvAhtiPyQHgikpcu1g9tXeb9jPGT` (deployed 2026-10-01, slot 452238910; replaces the abandoned `FD7kwF7E…`)
 - **Voltr access:** Voltr set our USDC vault's `allow_any_adaptor` policy (approved 2026-10-17), so adding a protocol here needs no new approval from them
-- **Deployer / upgrade authority:** `RAmcBEAZDXY61VQfXesDd5N1fEFJhaMaG6dNNjYCzCP`
+- **Upgrade authority:** `RAoEnBNgWR3H4L76UFtXNoJShLQ3yFSUcGPCDEzqmMb` (the vault admin; moved off the manager hot key 2026-10-17). It must never be the bot's manager key: a malicious upgrade gets the strategy authority signer for every position and skips Voltr's add_adaptor cooldown.
 - **Crate:** `hubra-usdc-adaptor` → `target/deploy/hubra_usdc_adaptor.so`
 
 | Protocol | Module | Strategy id | Status |
@@ -27,10 +27,17 @@ epoch unlocks or keeper-filled redemptions. The program enforces this for
 every protocol on every call (`src/common.rs`):
 
 - `settle_deposit`: the protocol must consume **exactly** `amount` from the
-  strategy's USDC ATA. Any leftover would be invisible to Voltr's accounting.
+  strategy's USDC ATA.
 - `settle_withdraw`: after redemption the strategy's USDC ATA must already
-  hold `amount`, which the vault sweeps right after, or the instruction fails
-  with `WithdrawNotSettled`.
+  hold `amount`, or the instruction fails with `WithdrawNotSettled`.
+
+What Voltr does around these calls (verified 2026-10-17 by running the real
+Voltr vault program in LiteSVM): after `withdraw_strategy` it sweeps the
+**whole** strategy USDC ATA back to idle, not just `amount`, and its vault
+`total_value` books whatever is left in that ATA. So a protocol that
+over-delivers (Perena's 30 bps gross-up) loses nothing, and a manager who
+swaps the deposit/withdraw discriminators can't move the vault's NAV. The test
+suites' `vaultSweep` models this.
 
 A protocol that only *sometimes* settles instantly (e.g. it has liquidity caps)
 will fail these checks when it doesn't, and the transaction rolls back. The
@@ -132,7 +139,7 @@ withdraw 80k CU. P0 (2026-10-17): deposit 65k, refresh 34k, withdraw 82k CU.
 
 ## Deployment
 
-The upgrade authority is `RAmcBEAZDXY61VQfXesDd5N1fEFJhaMaG6dNNjYCzCP`.
+The upgrade authority is `RAoEnBNgWR3H4L76UFtXNoJShLQ3yFSUcGPCDEzqmMb` (vault admin), not the bot's manager key.
 
 1. Voltr enables the vault's `allow_any_adaptor` policy (checked in the vault
    program's `add_adaptor`). This is per vault: a new Hubra vault needs its
@@ -182,6 +189,16 @@ the adaptor grosses withdrawals up by 30bps and clamps to the share balance.
 (`getP0PositionValue` in the rebalancer). The adaptor withdraws the exact
 amount and marginfi rejects anything above the position. Share rounding can
 leave 1 base unit, which stays counted and clears on the next exit.
+
+**Closed marginfi account (P0):** marginfi's `admin_close_account` is
+permissionless for an account that is empty (all balances < 1 share) and has
+had no deposit/withdraw for 60 days; the rent goes to P0's fee wallet. The
+adaptor treats a closed account as value 0 (refresh), fails withdraws with
+`NoPosition`, and the next deposit re-opens it via `init_pda`, paying the rent
+(~0.0124 SOL) **from the strategy authority PDA**
+(`9LYtJgCm4DbbJQfaWz2K8gqfFqPWmjnXjHgZbJEvbBw7` for the Hubra USDC vault). Keep
+that PDA funded: `setup-hubra-adaptor.ts --send` tops it up to 0.05 SOL. If it
+is empty, the re-opening deposit fails cleanly and funds stay idle.
 
 ## P0 (marginfi v2) key addresses
 
